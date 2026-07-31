@@ -18,8 +18,11 @@ and because CUDA IPC requires distinct processes.
 """
 
 import asyncio
+import importlib.util
 import multiprocessing as mp
+import pickle
 import uuid
+from pathlib import Path
 
 import pytest
 import torch
@@ -32,6 +35,18 @@ PROCESS_TIMEOUT = 60
 # which would make subsequent fork-based multiprocessing in other tests unsafe.
 HAS_ACCELERATOR = get_device_name() != "cpu"
 HAS_CUDA = "cuda" in get_device_name()
+
+
+def _load_bucketed_weight_transfer():
+    module_path = Path(__file__).resolve().parents[2] / "verl/workers/rollout/vllm_rollout/bucketed_weight_transfer.py"
+    spec = importlib.util.spec_from_file_location("bucketed_weight_transfer", module_path)
+    module = importlib.util.module_from_spec(spec)
+    assert spec is not None and spec.loader is not None
+    spec.loader.exec_module(module)
+    return module
+
+
+_bucketed_weight_transfer = _load_bucketed_weight_transfer()
 
 
 def _unique_zmq_handle():
@@ -73,15 +88,35 @@ class _FakeTorchDevice:
     def synchronize(self):
         pass
 
+    def empty_cache(self):
+        pass
+
+
+class _FakeReceiverSocket:
+    def __init__(self, metadata, on_first_ack=None):
+        self.metadata = iter(metadata)
+        self.sent = []
+        self.on_first_ack = on_first_ack
+        self.closed = False
+
+    def recv_pyobj(self):
+        return next(self.metadata)
+
+    def send_pyobj(self, message):
+        self.sent.append(message)
+        if len(self.sent) == 1 and self.on_first_ack is not None:
+            self.on_first_ack()
+
+    def close(self, linger=0):
+        self.closed = True
+
 
 def test_sender_accepts_strided_tensor(monkeypatch):
-    from verl.workers.rollout.vllm_rollout import bucketed_weight_transfer
-
     base = torch.arange(2 * 3 * 4, dtype=torch.float32).reshape(2, 3, 4)
     weight = base[:, 0, :]
     buffer = torch.empty(weight.nbytes, dtype=torch.uint8)
     socket = _FakeSocket()
-    sender = bucketed_weight_transfer.BucketedWeightSender(
+    sender = _bucketed_weight_transfer.BucketedWeightSender(
         zmq_handle="ipc:///tmp/test-bwt-unused.sock",
         bucket_size_mb=1,
         use_shm=True,
@@ -94,7 +129,7 @@ def test_sender_accepts_strided_tensor(monkeypatch):
     monkeypatch.setattr(sender, "_init_socket", lambda: setattr(sender, "socket", socket))
     monkeypatch.setattr(sender, "_init_buffer", lambda: setattr(sender, "buffer", buffer))
     monkeypatch.setattr(sender, "_cleanup", lambda: None)
-    monkeypatch.setattr(bucketed_weight_transfer, "get_torch_device", lambda: _FakeTorchDevice())
+    monkeypatch.setattr(_bucketed_weight_transfer, "get_torch_device", lambda: _FakeTorchDevice())
 
     asyncio.run(sender.async_send_weights(iter([("strided", weight)])))
 
@@ -117,6 +152,87 @@ def test_sender_accepts_strided_tensor(monkeypatch):
     assert buffer.dtype == torch.uint8
     assert buffer.numel() == weight.nbytes
     assert torch.equal(recovered, weight)
+
+
+def test_receiver_iterator_clones_reused_bucket_and_defers_final_ack(monkeypatch):
+    first = torch.tensor([1.0, 2.0], dtype=torch.float32)
+    second = torch.tensor([7.0, 8.0], dtype=torch.float32)
+    buffer = torch.empty(first.nbytes, dtype=torch.uint8)
+    buffer.view(torch.float32).copy_(first)
+    metadata = [
+        {
+            "bucket_meta": {
+                "first.weight": {
+                    "name": "first.weight",
+                    "shape": first.shape,
+                    "dtype": first.dtype,
+                    "offset": 0,
+                    "handle": None,
+                }
+            },
+            "is_last": False,
+        },
+        {
+            "bucket_meta": {
+                "second.weight": {
+                    "name": "second.weight",
+                    "shape": second.shape,
+                    "dtype": second.dtype,
+                    "offset": 0,
+                    "handle": None,
+                }
+            },
+            "is_last": True,
+        },
+    ]
+    socket = _FakeReceiverSocket(metadata, on_first_ack=lambda: buffer.view(torch.float32).copy_(second))
+    receiver = _bucketed_weight_transfer.BucketedWeightReceiver(
+        zmq_handle="ipc:///tmp/test-bwt-unused.sock",
+        device=torch.device("cpu"),
+    )
+    monkeypatch.setattr(receiver, "_init_socket", lambda: setattr(receiver, "socket", socket))
+    monkeypatch.setattr(receiver, "_init_buffer", lambda: setattr(receiver, "buffer", buffer))
+    monkeypatch.setattr(_bucketed_weight_transfer, "get_torch_device", lambda: _FakeTorchDevice())
+    monkeypatch.setattr(_bucketed_weight_transfer, "is_support_ipc", lambda: False)
+
+    received = list(receiver.iter_weights(clone=True, defer_last_ack=True))
+
+    assert [name for name, _ in received] == ["first.weight", "second.weight"]
+    torch.testing.assert_close(received[0][1], first)
+    torch.testing.assert_close(received[1][1], second)
+    assert socket.sent == [{"ok": True}]
+
+    receiver.finish()
+
+    assert socket.sent == [{"ok": True}, {"ok": True}]
+    assert socket.closed
+
+
+def test_sender_raises_receiver_error_ack():
+    class _ErrorAckSocket:
+        def recv(self):
+            return pickle.dumps({"ok": False, "error": "ValueError: native reload failed"})
+
+    sender = _bucketed_weight_transfer.BucketedWeightSender("ipc:///tmp/test-bwt-unused.sock")
+    sender.socket = _ErrorAckSocket()
+
+    with pytest.raises(_bucketed_weight_transfer.WeightTransferError, match="native reload failed"):
+        sender._recv_ack("waiting for test acknowledgement")
+
+
+def test_sender_ack_timeout_is_bounded():
+    class _TimeoutSocket:
+        def recv(self):
+            raise _bucketed_weight_transfer.zmq.Again()
+
+    sender = _bucketed_weight_transfer.BucketedWeightSender(
+        "ipc:///tmp/test-bwt-unused.sock",
+        timeout_seconds=0.01,
+    )
+    sender.socket = _TimeoutSocket()
+
+    with pytest.raises(TimeoutError, match="Timed out after 0.01s"):
+        sender._recv_ack("waiting for test acknowledgement")
 
 
 # ---------------------------------------------------------------------------

@@ -20,8 +20,9 @@ Not recommended depending on vllm for this file.
 import gc
 import logging
 import os
+import pickle
 from multiprocessing import shared_memory
-from typing import Callable, TypedDict
+from typing import Callable, Iterator, TypedDict
 
 import torch
 import zmq
@@ -31,6 +32,12 @@ from verl.utils.device import get_device_id, get_device_name, get_torch_device, 
 
 logger = logging.getLogger(__file__)
 logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "INFO"))
+
+DEFAULT_WEIGHT_TRANSFER_TIMEOUT_SECONDS = 600.0
+
+
+class WeightTransferError(RuntimeError):
+    """A peer reported that bucketed weight transfer failed."""
 
 
 class TensorMetadata(TypedDict):
@@ -82,6 +89,8 @@ class BucketedWeightSender:
         zmq_handle: ZMQ IPC socket path (e.g., "ipc:///tmp/rl-colocate-zmq-<uuid>.sock")
         bucket_size_mb: Communication buffer size in MB
         use_shm: Use shared memory instead of CUDA IPC (for NPU compatibility)
+        timeout_seconds: Send/receive timeout. Defaults to 600 seconds and can
+            be overridden with ``VERL_WEIGHT_TRANSFER_TIMEOUT_SECONDS``.
     """
 
     def __init__(
@@ -89,11 +98,13 @@ class BucketedWeightSender:
         zmq_handle: str,
         bucket_size_mb: int = 512,
         use_shm: bool = False,
+        timeout_seconds: float | None = None,
     ):
         self.zmq_handle = zmq_handle
         self.bucket_size_mb = bucket_size_mb
         self.bucket_size = int(bucket_size_mb) << 20
         self.use_shm = use_shm
+        self.timeout_seconds = _resolve_timeout_seconds(timeout_seconds)
 
         self.zmq_context = zmq.Context.instance()
         self.socket = None
@@ -129,7 +140,7 @@ class BucketedWeightSender:
                 if offset + weight.nbytes > self.bucket_size and len(bucket_meta) > 0:
                     get_torch_device().synchronize()
                     self.socket.send_pyobj({"bucket_meta": bucket_meta, "is_last": False})
-                    self.socket.recv()
+                    self._recv_ack("waiting for bucket acknowledgement")
                     bucket_meta = {}
                     offset = 0
 
@@ -156,7 +167,7 @@ class BucketedWeightSender:
             # send the last bucket
             get_torch_device().synchronize()
             self.socket.send_pyobj({"bucket_meta": bucket_meta, "is_last": True})
-            self.socket.recv()
+            self._recv_ack("waiting for final reload acknowledgement")
         finally:
             self._cleanup()
 
@@ -169,7 +180,33 @@ class BucketedWeightSender:
             except OSError:
                 pass
         self.socket = self.zmq_context.socket(zmq.REQ)
+        self._configure_socket()
         self.socket.bind(self.zmq_handle)
+
+    def _configure_socket(self):
+        timeout_ms = max(1, int(self.timeout_seconds * 1000))
+        self.socket.setsockopt(zmq.SNDTIMEO, timeout_ms)
+        self.socket.setsockopt(zmq.RCVTIMEO, timeout_ms)
+        self.socket.setsockopt(zmq.LINGER, 0)
+
+    def _recv_ack(self, context: str):
+        try:
+            payload = self.socket.recv()
+        except zmq.Again as exc:
+            raise TimeoutError(f"Timed out after {self.timeout_seconds:g}s {context}") from exc
+
+        # Empty ACKs were used before the structured failure protocol. Keep
+        # accepting them so sender/receiver upgrades do not need to be atomic.
+        if payload == b"":
+            return
+        try:
+            ack = pickle.loads(payload)
+        except Exception as exc:
+            raise WeightTransferError(f"Malformed weight-transfer acknowledgement: {payload[:128]!r}") from exc
+        if not isinstance(ack, dict) or "ok" not in ack:
+            raise WeightTransferError(f"Malformed weight-transfer acknowledgement: {ack!r}")
+        if not ack["ok"]:
+            raise WeightTransferError(ack.get("error", "The rollout worker rejected the weight update"))
 
     def _init_buffer(self):
         """build communication buffer"""
@@ -189,7 +226,7 @@ class BucketedWeightSender:
             comm_metadata = {"name": shm_name, "size": self.bucket_size}
             self.socket.send_pyobj(comm_metadata)
 
-        self.socket.recv()
+        self._recv_ack("waiting for IPC buffer acknowledgement")
         self.buffer = buffer
         self.shm = shm
 
@@ -230,7 +267,7 @@ class BucketedWeightSender:
             "handle": handle,
         }
         self.socket.send_pyobj({"bucket_meta": bucket_meta, "is_last": False})
-        self.socket.recv()
+        self._recv_ack(f"waiting for acknowledgement of large weight {name!r}")
 
 
 class BucketedWeightReceiver:
@@ -244,6 +281,8 @@ class BucketedWeightReceiver:
         zmq_handle: ZMQ IPC socket path (must match sender)
         device: Target device for received tensors
         use_shm: Use shared memory instead of CUDA IPC
+        timeout_seconds: Send/receive timeout. Defaults to 600 seconds and can
+            be overridden with ``VERL_WEIGHT_TRANSFER_TIMEOUT_SECONDS``.
     """
 
     def __init__(
@@ -251,15 +290,20 @@ class BucketedWeightReceiver:
         zmq_handle: str,
         device: torch.device,
         use_shm: bool = False,
+        timeout_seconds: float | None = None,
     ):
         self.zmq_handle = zmq_handle
         self.device = device
         self.use_shm = use_shm
+        self.timeout_seconds = _resolve_timeout_seconds(timeout_seconds)
 
         self.zmq_context = zmq.Context.instance()
         self.socket = None
         self.buffer = None
         self.shm = None
+        self._pending_ack = False
+        self._stream_exhausted = False
+        self._cleaned_up = False
 
     def receive_weights(self, on_bucket_received: callable):
         """
@@ -274,31 +318,113 @@ class BucketedWeightReceiver:
 
             # receive bucket and update weights
             while True:
-                metadata = self.socket.recv_pyobj()
-                weights, tensor = [], None
-                for name, meta in metadata["bucket_meta"].items():
-                    shape, dtype, offset, handle = meta["shape"], meta["dtype"], meta["offset"], meta["handle"]
-                    if handle is not None:
-                        tensor = rebuild_ipc(handle, self.device.index)
-                        weights.append((name, tensor))
-                        continue
-                    size = dtype.itemsize * shape.numel()
-                    tensor = self.buffer[offset : offset + size].view(dtype=dtype).view(shape)
-                    if self.use_shm:
-                        tensor = tensor.to(self.device)
-                    weights.append((name, tensor))
-                on_bucket_received(weights)
-                get_torch_device().synchronize()
-                self.socket.send(b"")
-                del weights, tensor
+                metadata = self._receive_metadata()
+                try:
+                    weights = self._build_weights(metadata)
+                    on_bucket_received(weights)
+                    get_torch_device().synchronize()
+                except BaseException as exc:
+                    self.abort(exc)
+                    raise
+                self._send_ack(ok=True)
                 if metadata["is_last"]:
+                    self._stream_exhausted = True
                     break
         finally:
             self._cleanup()
 
+    def iter_weights(self, *, clone: bool, defer_last_ack: bool = False) -> Iterator[tuple[str, torch.Tensor]]:
+        """Yield a complete cross-bucket weight stream.
+
+        When ``clone`` is true, every tensor owns storage independent of the
+        reused IPC buffer and the sender's lifetime. With ``defer_last_ack``,
+        the caller must invoke :meth:`finish` after its post-load processing
+        succeeds, or :meth:`abort` on any failure.
+        """
+        self._init_socket()
+        self._init_buffer()
+
+        while True:
+            metadata = self._receive_metadata()
+            try:
+                weights = self._build_weights(metadata)
+                for name, tensor in weights:
+                    yield name, tensor.clone() if clone else tensor
+                # clone/copy operations must finish before the sender reuses or
+                # releases the storage backing this bucket.
+                get_torch_device().synchronize()
+            except BaseException as exc:
+                self.abort(exc)
+                raise
+
+            if metadata["is_last"]:
+                self._stream_exhausted = True
+                if not defer_last_ack:
+                    self._send_ack(ok=True)
+                    self._cleanup()
+                return
+            self._send_ack(ok=True)
+
+    def finish(self):
+        """Acknowledge a fully consumed deferred stream and release resources."""
+        if not self._stream_exhausted or not self._pending_ack:
+            error = RuntimeError("Cannot finish weight transfer before the complete stream has been consumed")
+            self.abort(error)
+            raise error
+        try:
+            self._send_ack(ok=True)
+        finally:
+            self._cleanup()
+
+    def abort(self, error: BaseException):
+        """Report a receiver/reload failure to the blocked sender."""
+        try:
+            if self._pending_ack:
+                self._send_ack(ok=False, error=f"{type(error).__name__}: {error}")
+        except Exception:
+            logger.exception("Failed to send weight-transfer error acknowledgement")
+        finally:
+            self._cleanup()
+
+    def _receive_metadata(self):
+        try:
+            metadata = self.socket.recv_pyobj()
+        except zmq.Again as exc:
+            raise TimeoutError(f"Timed out after {self.timeout_seconds:g}s waiting for a weight bucket") from exc
+        self._pending_ack = True
+        return metadata
+
+    def _build_weights(self, metadata) -> list[tuple[str, torch.Tensor]]:
+        weights = []
+        for name, meta in metadata["bucket_meta"].items():
+            shape, dtype, offset, handle = meta["shape"], meta["dtype"], meta["offset"], meta["handle"]
+            if handle is not None:
+                tensor = rebuild_ipc(handle, self.device.index)
+            else:
+                size = dtype.itemsize * shape.numel()
+                tensor = self.buffer[offset : offset + size].view(dtype=dtype).view(shape)
+                if self.use_shm:
+                    tensor = tensor.to(self.device)
+            weights.append((name, tensor))
+        return weights
+
+    def _send_ack(self, *, ok: bool, error: str | None = None):
+        ack = {"ok": ok}
+        if error is not None:
+            ack["error"] = error
+        try:
+            self.socket.send_pyobj(ack)
+        except zmq.Again as exc:
+            raise TimeoutError(f"Timed out after {self.timeout_seconds:g}s sending a weight-transfer ACK") from exc
+        self._pending_ack = False
+
     def _init_socket(self):
         """Initialize ZMQ REP socket and connect."""
         self.socket = self.zmq_context.socket(zmq.REP)
+        timeout_ms = max(1, int(self.timeout_seconds * 1000))
+        self.socket.setsockopt(zmq.SNDTIMEO, timeout_ms)
+        self.socket.setsockopt(zmq.RCVTIMEO, timeout_ms)
+        self.socket.setsockopt(zmq.LINGER, 0)
         self.socket.connect(self.zmq_handle)
 
     def _init_buffer(self):
@@ -313,19 +439,22 @@ class BucketedWeightReceiver:
             shm_name = comm_metadata["name"]
             shm_size = comm_metadata["size"]
             buffer, shm = rebuild_shared_memory(shm_name, shm_size, dtype=torch.uint8)
-        self.socket.send(b"")
+        self.socket.send_pyobj({"ok": True})
         self.buffer = buffer
         self.shm = shm
 
     def _cleanup(self):
         """clean up"""
+        if self._cleaned_up:
+            return
+        self._cleaned_up = True
         if self.socket is not None:
-            self.socket.close()
+            self.socket.close(linger=0)
             self.socket = None
         # Synchronize before releasing the buffer to ensure all async ops
         # referencing it (e.g. clone, .to()) have completed.
-        get_torch_device().synchronize()
-        del self.buffer
+        if self.buffer is not None:
+            get_torch_device().synchronize()
         self.buffer = None
         if self.shm is not None:
             self.shm.close()
@@ -335,3 +464,13 @@ class BucketedWeightReceiver:
         if is_support_ipc():
             get_torch_device().ipc_collect()
         get_torch_device().empty_cache()
+
+
+def _resolve_timeout_seconds(timeout_seconds: float | None) -> float:
+    if timeout_seconds is None:
+        timeout_seconds = float(
+            os.environ.get("VERL_WEIGHT_TRANSFER_TIMEOUT_SECONDS", DEFAULT_WEIGHT_TRANSFER_TIMEOUT_SECONDS)
+        )
+    if timeout_seconds <= 0:
+        raise ValueError(f"timeout_seconds must be positive, got {timeout_seconds}")
+    return timeout_seconds

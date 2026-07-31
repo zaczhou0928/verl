@@ -17,6 +17,7 @@ import sys
 import types
 from pathlib import Path
 
+import pytest
 import torch
 
 _REPO_ROOT = Path(__file__).resolve().parents[3]
@@ -80,6 +81,9 @@ def _load_vllm_rollout_utils():
     fake_vllm_fp8.is_fp8_model = lambda config: False
     fake_vllm_fp8.load_quanted_weights = lambda weights, runner, is_drafter=False: weights
 
+    fake_vllm_online_quant = types.ModuleType("verl.utils.vllm.vllm_online_quant_utils")
+    fake_vllm_online_quant.requires_native_vllm_reload = lambda config: False
+
     fake_platform = types.ModuleType("verl.plugin.platform")
     fake_platform.get_platform = lambda: None
 
@@ -90,6 +94,7 @@ def _load_vllm_rollout_utils():
         "verl.utils.vllm": fake_vllm_utils,
         "verl.utils.vllm.patch": fake_vllm_patch,
         "verl.utils.vllm.vllm_fp8_utils": fake_vllm_fp8,
+        "verl.utils.vllm.vllm_online_quant_utils": fake_vllm_online_quant,
         "verl.plugin.platform": fake_platform,
         "verl.workers.rollout.vllm_rollout.weight_update_utils": _weight_update_utils,
     }
@@ -242,3 +247,105 @@ def test_vllm_update_weights_syncs_buffers_to_mtp_drafter():
     expected = torch.tensor([5, 6, 7, 8], dtype=torch.float32)
     torch.testing.assert_close(main_model.model.layers[0].e_score_correction_bias, expected)
     torch.testing.assert_close(drafter_model.model.layers[0].e_score_correction_bias, expected)
+
+
+class _FakeNativeReceiver:
+    instances = []
+    weights = [
+        ("model.layers.0.self_attn.q_proj.weight", torch.ones(2, 2)),
+        ("lm_head.weight", torch.full((2, 2), 2.0)),
+    ]
+
+    def __init__(self, **kwargs):
+        self.kwargs = kwargs
+        self.finished = False
+        self.aborted_with = None
+        self.iter_options = None
+        self.__class__.instances.append(self)
+
+    def iter_weights(self, **kwargs):
+        self.iter_options = kwargs
+        return iter(self.weights)
+
+    def finish(self):
+        self.finished = True
+
+    def abort(self, error):
+        self.aborted_with = error
+
+
+def _make_native_reload_worker(reload_weights):
+    worker = object.__new__(vLLMColocateWorkerExtension)
+    worker.model_runner = _FakeModelRunner(_ToyModel())
+    worker.device = torch.device("cpu")
+    worker.local_rank = 0
+    worker._native_reload_poisoned = False
+    worker._get_zmq_handle = lambda: "ipc:///tmp/test-native-mxfp8.sock"
+    worker.reload_weights = reload_weights
+    return worker
+
+
+def test_online_mxfp8_uses_one_native_reload_for_complete_stream():
+    _FakeNativeReceiver.instances.clear()
+    received = []
+    calls = []
+
+    def _reload_weights(*, weights_iterator, is_checkpoint_format):
+        calls.append(is_checkpoint_format)
+        received.extend(weights_iterator)
+
+    worker = _make_native_reload_worker(_reload_weights)
+    worker._reload_online_mxfp8_from_ipc(_FakeNativeReceiver, peft_config=None, use_shm=False)
+
+    receiver = _FakeNativeReceiver.instances[-1]
+    assert calls == [True]
+    assert [name for name, _ in received] == [name for name, _ in _FakeNativeReceiver.weights]
+    assert receiver.iter_options == {"clone": True, "defer_last_ack": True}
+    assert receiver.finished
+    assert receiver.aborted_with is None
+    assert not worker._native_reload_poisoned
+
+
+def test_online_mxfp8_reload_failure_poison_worker_and_rejects_next_sync():
+    _FakeNativeReceiver.instances.clear()
+
+    def _reload_weights(*, weights_iterator, is_checkpoint_format):
+        next(iter(weights_iterator))
+        raise ValueError("quantization failed")
+
+    worker = _make_native_reload_worker(_reload_weights)
+
+    with pytest.raises(ValueError, match="quantization failed"):
+        worker._reload_online_mxfp8_from_ipc(_FakeNativeReceiver, peft_config=None, use_shm=False)
+
+    receiver = _FakeNativeReceiver.instances[-1]
+    assert isinstance(receiver.aborted_with, ValueError)
+    assert worker._native_reload_poisoned
+
+    with pytest.raises(RuntimeError, match="poisoned"):
+        worker._reload_online_mxfp8_from_ipc(_FakeNativeReceiver, peft_config=None, use_shm=False)
+
+
+def test_online_mxfp8_rejects_training_side_scale_weights():
+    weights = [
+        ("model.layers.0.mlp.down_proj.weight", torch.ones(2, 2)),
+        ("model.layers.0.mlp.down_proj.weight_scale", torch.ones(2)),
+    ]
+
+    with pytest.raises(ValueError, match="quantization scale"):
+        list(vLLMColocateWorkerExtension._reject_online_mxfp8_scale_weights(weights))
+
+
+def test_online_mxfp8_does_not_apply_legacy_fp8_patch(monkeypatch):
+    patch_calls = []
+    monkeypatch.setenv("VERL_VLLM_FP8_QUANT_ENABLED", "1")
+    monkeypatch.setattr(_vllm_rollout_utils, "requires_native_vllm_reload", lambda config: True)
+    monkeypatch.setattr(_vllm_rollout_utils, "apply_vllm_fp8_patches", lambda: patch_calls.append(True))
+
+    worker = vLLMColocateWorkerExtension.__new__(
+        vLLMColocateWorkerExtension,
+        vllm_config=types.SimpleNamespace(quant_config=None),
+    )
+
+    assert patch_calls == []
+    assert not worker._native_reload_poisoned

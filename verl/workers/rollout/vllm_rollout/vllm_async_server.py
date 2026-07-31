@@ -1022,8 +1022,8 @@ class vLLMHttpServer:
             logger.info(f"QAT quantization config injected (quant_method={quant_method})")
             hf_overrides["quantization_config"] = quantization_config_dict
         elif quantization is not None:
-            # Handle other quantization methods (fp8, torchao)
-            _SUPPORTED_QUANTIZATION = ["fp8", "torchao", "ascend"]
+            # Handle other quantization methods (fp8, mxfp8, torchao)
+            _SUPPORTED_QUANTIZATION = ["fp8", "mxfp8", "torchao", "ascend"]
             if quantization not in _SUPPORTED_QUANTIZATION:
                 raise ValueError(f"Currently only support {_SUPPORTED_QUANTIZATION} quantization, got: {quantization}")
 
@@ -1046,6 +1046,8 @@ class vLLMHttpServer:
                 apply_vllm_fp8_patches()
                 # for subprocesses patching
                 os.environ["VERL_VLLM_FP8_QUANT_ENABLED"] = "1"
+            elif quantization == "mxfp8":
+                self._validate_online_mxfp8_support()
 
         model_quantization_config = getattr(self.model_config.hf_config, "quantization_config", {}) or {}
         if quantization is None and model_quantization_config.get("quant_method") == "fp8":
@@ -1056,6 +1058,70 @@ class vLLMHttpServer:
             hf_overrides["quantization_config_file"] = self.config.quantization_config_file
 
         return quantization, hf_overrides
+
+    def _validate_online_mxfp8_support(self) -> None:
+        """Fail fast for configurations outside the first native MXFP8 scope."""
+        min_version = version.parse("0.24.0")
+        if _VLLM_VERSION < min_version:
+            raise ValueError(
+                "vLLM online MXFP8 rollout requires vLLM >= 0.24.0; "
+                f"found vLLM {_VLLM_VERSION}. The validated recipe pins vLLM 0.24.0."
+            )
+
+        try:
+            from vllm.model_executor.layers.quantization.online.base import OnlineQuantizationConfig  # noqa: F401
+            from vllm.v1.worker.gpu_model_runner import GPUModelRunner
+        except ImportError as exc:
+            raise ValueError(
+                f"vLLM {_VLLM_VERSION} does not expose the online quantization/reload APIs required for MXFP8"
+            ) from exc
+
+        reload_params = inspect.signature(GPUModelRunner.reload_weights).parameters
+        required_params = {"weights_iterator", "is_checkpoint_format"}
+        if not required_params.issubset(reload_params):
+            raise ValueError(
+                f"vLLM {_VLLM_VERSION} GPUModelRunner.reload_weights is incompatible with online MXFP8 refit; "
+                f"expected parameters {sorted(required_params)}, found {sorted(reload_params)}"
+            )
+
+        if _VLLM_VERSION >= version.parse("0.25.0"):
+            logger.warning(
+                "vLLM online MXFP8 refit is validated on vLLM 0.24.0; proceeding with API-compatible vLLM %s",
+                _VLLM_VERSION,
+            )
+
+        lora_rank = max(self.model_config.lora_rank or 0, self.model_config.lora.get("rank", 0) or 0)
+        if lora_rank > 0:
+            raise NotImplementedError("vLLM online MXFP8 rollout does not support LoRA in the first implementation")
+
+        if self.config.mtp is not None and self.config.mtp.enable and self.config.mtp.enable_rollout:
+            raise NotImplementedError(
+                "vLLM online MXFP8 rollout does not support MTP drafter weight sync in the first implementation"
+            )
+
+        if self._disaggregation_role != "null":
+            raise NotImplementedError(
+                "vLLM online MXFP8 rollout does not support prefill/decode disaggregation in the first implementation"
+            )
+
+        if self.config.quantization_config_file is not None:
+            raise NotImplementedError(
+                "vLLM online MXFP8 rollout accepts BF16/FP16 actor weights and does not support "
+                "pre-quantized checkpoint configuration files"
+            )
+
+        checkpoint_quant_config = getattr(self.model_config.hf_config, "quantization_config", None)
+        if checkpoint_quant_config:
+            raise NotImplementedError(
+                "vLLM online MXFP8 rollout requires an unquantized BF16/FP16 checkpoint; "
+                "pre-quantized ModelOpt/compressed-tensors checkpoints are not supported"
+            )
+
+        engine_kwargs = self.config.get("engine_kwargs", {}).get(self._get_engine_kwargs_key(), {}) or {}
+        if (engine_kwargs.get("cpu_offload_gb", 0) or 0) > 0:
+            raise NotImplementedError(
+                "vLLM online MXFP8 rollout does not support vLLM CPU weight offload in the first implementation"
+            )
 
     def _get_worker_extension_cls(self) -> str:
         """Return the fully-qualified colocate worker extension class name."""

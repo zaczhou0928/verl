@@ -29,6 +29,7 @@ from verl.utils.device import get_device_name, is_npu_available
 from verl.utils.vllm import TensorLoRARequest, VLLMHijack
 from verl.utils.vllm.patch import patch_vllm_moe_model_weight_loader
 from verl.utils.vllm.vllm_fp8_utils import apply_vllm_fp8_patches, is_fp8_model, load_quanted_weights
+from verl.utils.vllm.vllm_online_quant_utils import requires_native_vllm_reload
 from verl.workers.rollout.vllm_rollout.weight_update_utils import apply_buffer_updates, split_buffer_updates
 
 logger = logging.getLogger(__file__)
@@ -159,7 +160,12 @@ class vLLMColocateWorkerExtension:
         vllm_config = kwargs.get("vllm_config")
         # 2. patch online fp8 quant. Some models, including DeepSeek-V4, get
         # fp8 from the HF config rather than an explicit rollout quantization arg.
-        if os.environ.get("VERL_VLLM_FP8_QUANT_ENABLED", "0") == "1" or is_fp8_model(vllm_config):
+        # vLLM online MXFP8 owns its reload/quantization lifecycle and must not
+        # enter verl's legacy block-FP8 monkey patch.
+        _requires_native_reload = requires_native_vllm_reload(vllm_config)
+        if not _requires_native_reload and (
+            os.environ.get("VERL_VLLM_FP8_QUANT_ENABLED", "0") == "1" or is_fp8_model(vllm_config)
+        ):
             apply_vllm_fp8_patches()
         # 3. patch QAT (compressed-tensors NVFP4) for dynamic weight loading
         quant_config = getattr(vllm_config, "quant_config", None) if vllm_config else None
@@ -187,6 +193,7 @@ class vLLMColocateWorkerExtension:
         instance = super().__new__(cls)
         instance._is_qat_model = _is_qat_model
         instance._is_modelopt_qat = _is_modelopt_qat
+        instance._native_reload_poisoned = False
         return instance
 
     def _get_drafter_model(self):
@@ -237,6 +244,13 @@ class vLLMColocateWorkerExtension:
             # vLLM workers may leave self.device unset on non-CUDA platforms (e.g. NPU);
             # fall back to the worker's local rank on the current accelerator.
             self.device = torch.device(f"{get_device_name()}:{self.local_rank}")
+
+        if requires_native_vllm_reload(self.model_runner.vllm_config):
+            return self._reload_online_mxfp8_from_ipc(
+                BucketedWeightReceiver=BucketedWeightReceiver,
+                peft_config=peft_config,
+                use_shm=use_shm,
+            )
 
         # =========================== step 1: prepare for weight loading ===========================
         quant_reload_states = None
@@ -309,6 +323,64 @@ class vLLMColocateWorkerExtension:
 
             for model, model_config in self._iter_all_models_with_config():
                 process_weights_after_loading(model, model_config, self.device)
+
+    def _reload_online_mxfp8_from_ipc(self, BucketedWeightReceiver, peft_config: dict, use_shm: bool):
+        """Consume one complete BF16/FP16 stream through vLLM's native reload API."""
+        if getattr(self, "_native_reload_poisoned", False):
+            raise RuntimeError(
+                "This vLLM worker is poisoned by a previous failed online MXFP8 reload and must be reconstructed"
+            )
+        if peft_config:
+            raise NotImplementedError("Online MXFP8 native reload does not support LoRA weight sync")
+        if self._use_mtp_drafter_weight_sync():
+            raise NotImplementedError("Online MXFP8 native reload does not support MTP drafter weight sync")
+
+        reload_weights = getattr(self, "reload_weights", None)
+        if not callable(reload_weights):
+            raise RuntimeError(
+                "Installed vLLM worker does not expose reload_weights(weights_iterator=..., is_checkpoint_format=True)"
+            )
+
+        receiver = BucketedWeightReceiver(
+            zmq_handle=self._get_zmq_handle(),
+            device=self.device,
+            use_shm=use_shm,
+        )
+        weights_iterator = receiver.iter_weights(clone=True, defer_last_ack=True)
+        try:
+            reload_weights(
+                weights_iterator=self._reject_online_mxfp8_scale_weights(weights_iterator),
+                is_checkpoint_format=True,
+            )
+            # The final ACK is deliberately sent only after vLLM's finalize,
+            # quantization, MoE packing, and cache resets have all succeeded.
+            receiver.finish()
+        except BaseException as exc:
+            self._native_reload_poisoned = True
+            receiver.abort(exc)
+            raise
+        finally:
+            close_iterator = getattr(weights_iterator, "close", None)
+            if close_iterator is not None:
+                close_iterator()
+
+        logger.info("vLLM online MXFP8 weights reloaded through the native vLLM reload API")
+
+    @staticmethod
+    def _reject_online_mxfp8_scale_weights(weights):
+        """Reject training-side quantization artifacts on the online path."""
+        scale_suffixes = (
+            ".weight_scale",
+            ".weight_scale_inv",
+            ".input_scale",
+            ".activation_scale",
+        )
+        for name, tensor in weights:
+            if name.endswith(scale_suffixes):
+                raise ValueError(
+                    f"Online MXFP8 expects BF16/FP16 checkpoint weights, but received quantization scale {name!r}"
+                )
+            yield name, tensor
 
     def _apply_buffer_updates_all_models(self, buffer_updates, main_named_buffers):
         """Apply buffer updates to the main model and any synced MTP drafter.
