@@ -165,6 +165,7 @@ class vLLMColocateWorkerExtension:
         quant_config = getattr(vllm_config, "quant_config", None) if vllm_config else None
         _is_qat_model = getattr(quant_config, "quant_format", None) == "nvfp4-pack-quantized"
         _is_modelopt_qat = type(quant_config).__name__ == "ModelOptNvFp4Config"
+        _is_modelopt_mxfp8 = type(quant_config).__name__ == "ModelOptMxFp8Config"
         if _is_qat_model:
             from verl.utils.qat import apply_qat_patches
 
@@ -187,6 +188,7 @@ class vLLMColocateWorkerExtension:
         instance = super().__new__(cls)
         instance._is_qat_model = _is_qat_model
         instance._is_modelopt_qat = _is_modelopt_qat
+        instance._is_modelopt_mxfp8 = _is_modelopt_mxfp8
         return instance
 
     def _get_drafter_model(self):
@@ -258,6 +260,11 @@ class vLLMColocateWorkerExtension:
             # TODO: this is buggy if lora span multiple buckets.
             self.remove_lora(VLLM_LORA_INT_ID)
             logger.info("LoRA adapter sync: remove old lora and prepare new lora")
+        elif self._is_modelopt_mxfp8:
+            from vllm.model_executor.model_loader.reload import initialize_layerwise_reload
+
+            self._mxfp8_buffer_updates = []
+            initialize_layerwise_reload(self.model_runner.model)
         elif is_fp8_model(self.model_runner.vllm_config):
             from verl.utils.vllm.vllm_quant_utils import prepare_quanted_weights_for_loading
 
@@ -298,6 +305,13 @@ class vLLMColocateWorkerExtension:
             logger.info("ModelOpt QAT: process_weights_after_loading completed")
         elif peft_config and base_sync_done:
             logger.info("LoRA adapter sync, no post-process needed")
+        elif self._is_modelopt_mxfp8:
+            from vllm.model_executor.model_loader.reload import finalize_layerwise_reload
+
+            finalize_layerwise_reload(self.model_runner.model, self.model_runner.vllm_config.model_config)
+            # Buffers are only real tensors again after finalize: while layerwise
+            # reload holds them on the meta device, copy_ silently drops the write.
+            self._apply_buffer_updates_all_models(self._mxfp8_buffer_updates, None)
         elif is_fp8_model(self.model_runner.vllm_config):
             from verl.utils.vllm.vllm_quant_utils import process_quanted_weights_after_loading
 
@@ -356,6 +370,12 @@ class vLLMColocateWorkerExtension:
                 logger.info(
                     f"FP8 weights loaded (async), loaded_params: {len(loaded_params)}, loaded_buffers: {loaded_buffers}"
                 )
+            elif self._is_modelopt_mxfp8:
+                from verl.utils.vllm.vllm_modelopt_mxfp8_utils import load_modelopt_mxfp8_weights
+
+                loaded_params = load_modelopt_mxfp8_weights(param_updates, self.model_runner) if param_updates else []
+                self._mxfp8_buffer_updates.extend((name, tensor.clone()) for name, tensor in buffer_updates)
+                logger.info(f"MXFP8 weights loaded, loaded_params: {len(loaded_params)}")
             else:
                 if param_updates:
                     for model in self._iter_all_models():

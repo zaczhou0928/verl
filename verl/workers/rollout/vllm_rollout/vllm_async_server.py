@@ -1022,8 +1022,8 @@ class vLLMHttpServer:
             logger.info(f"QAT quantization config injected (quant_method={quant_method})")
             hf_overrides["quantization_config"] = quantization_config_dict
         elif quantization is not None:
-            # Handle other quantization methods (fp8, torchao)
-            _SUPPORTED_QUANTIZATION = ["fp8", "torchao", "ascend"]
+            # Handle other quantization methods (fp8, modelopt_mxfp8, torchao)
+            _SUPPORTED_QUANTIZATION = ["fp8", "modelopt_mxfp8", "torchao", "ascend"]
             if quantization not in _SUPPORTED_QUANTIZATION:
                 raise ValueError(f"Currently only support {_SUPPORTED_QUANTIZATION} quantization, got: {quantization}")
 
@@ -1045,6 +1045,15 @@ class vLLMHttpServer:
                 apply_vllm_quant_patches()
                 # for subprocesses patching
                 os.environ["VERL_VLLM_FP8_QUANT_ENABLED"] = "1"
+            elif quantization == "modelopt_mxfp8":
+                # The refit only reloads the main model, so a drafter would silently
+                # keep serving stale weights.
+                mtp_config = getattr(self.config, "mtp", None)
+                if mtp_config is not None and mtp_config.enable and mtp_config.enable_rollout:
+                    raise ValueError("modelopt_mxfp8 rollout does not support MTP drafter weight sync.")
+                from verl.utils.vllm.vllm_modelopt_mxfp8_utils import get_modelopt_mxfp8_quant_config
+
+                hf_overrides["quantization_config"] = get_modelopt_mxfp8_quant_config()
 
         model_quantization_config = getattr(self.model_config.hf_config, "quantization_config", {}) or {}
         if quantization is None and model_quantization_config.get("quant_method") == "fp8":
