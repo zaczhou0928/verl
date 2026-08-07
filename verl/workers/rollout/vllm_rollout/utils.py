@@ -165,6 +165,7 @@ class vLLMColocateWorkerExtension:
         quant_config = getattr(vllm_config, "quant_config", None) if vllm_config else None
         _is_qat_model = getattr(quant_config, "quant_format", None) == "nvfp4-pack-quantized"
         _is_modelopt_qat = type(quant_config).__name__ == "ModelOptNvFp4Config"
+        _is_online_quant = type(quant_config).__name__ == "OnlineQuantizationConfig"
         if _is_qat_model:
             from verl.utils.qat import apply_qat_patches
 
@@ -187,6 +188,7 @@ class vLLMColocateWorkerExtension:
         instance = super().__new__(cls)
         instance._is_qat_model = _is_qat_model
         instance._is_modelopt_qat = _is_modelopt_qat
+        instance._is_online_quant = _is_online_quant
         return instance
 
     def _get_drafter_model(self):
@@ -258,6 +260,14 @@ class vLLMColocateWorkerExtension:
             # TODO: this is buggy if lora span multiple buckets.
             self.remove_lora(VLLM_LORA_INT_ID)
             logger.info("LoRA adapter sync: remove old lora and prepare new lora")
+        elif self._is_online_quant:
+            # vLLM re-quantizes the incoming BF16 weights in
+            # process_weights_after_loading; layerwise reload restores the
+            # checkpoint layout first and re-runs it per layer.
+            from vllm.model_executor.model_loader.reload import initialize_layerwise_reload
+
+            self._online_quant_buffer_updates = []
+            initialize_layerwise_reload(self.model_runner.model)
         elif is_fp8_model(self.model_runner.vllm_config):
             from verl.utils.vllm.vllm_quant_utils import prepare_quanted_weights_for_loading
 
@@ -298,6 +308,13 @@ class vLLMColocateWorkerExtension:
             logger.info("ModelOpt QAT: process_weights_after_loading completed")
         elif peft_config and base_sync_done:
             logger.info("LoRA adapter sync, no post-process needed")
+        elif self._is_online_quant:
+            from vllm.model_executor.model_loader.reload import finalize_layerwise_reload
+
+            finalize_layerwise_reload(self.model_runner.model, self.model_runner.vllm_config.model_config)
+            # Buffers are only real tensors again after finalize: while layerwise
+            # reload holds them on the meta device, copy_ silently drops the write.
+            self._apply_buffer_updates_all_models(self._online_quant_buffer_updates, None)
         elif is_fp8_model(self.model_runner.vllm_config):
             from verl.utils.vllm.vllm_quant_utils import process_quanted_weights_after_loading
 
@@ -356,6 +373,12 @@ class vLLMColocateWorkerExtension:
                 logger.info(
                     f"FP8 weights loaded (async), loaded_params: {len(loaded_params)}, loaded_buffers: {loaded_buffers}"
                 )
+            elif self._is_online_quant:
+                # Weights stay BF16 on the wire; vLLM quantizes them at
+                # process_weights_after_loading time.
+                loaded_params = self.model_runner.model.load_weights(param_updates) if param_updates else []
+                self._online_quant_buffer_updates.extend((name, tensor.clone()) for name, tensor in buffer_updates)
+                logger.info(f"MXFP8 online weights loaded, loaded_params: {len(loaded_params)}")
             else:
                 if param_updates:
                     for model in self._iter_all_models():

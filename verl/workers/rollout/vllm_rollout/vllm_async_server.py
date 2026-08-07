@@ -265,7 +265,7 @@ class vLLMHttpServer:
 
             set_expandable_segments(True)
 
-        quantization, hf_overrides = self._apply_quantization()
+        quantization, hf_overrides, quantization_config = self._apply_quantization()
 
         compilation_config = engine_kwargs.pop("compilation_config", None) or {}
         if isinstance(compilation_config, str):
@@ -306,6 +306,7 @@ class vLLMHttpServer:
             "seed": self.replica_rank + self.config.seed,
             "override_generation_config": json.dumps(override_generation_config),
             "quantization": quantization,
+            "quantization_config": quantization_config,
             "hf_overrides": hf_overrides,
             "scheduling_policy": self.config.scheduling_policy,
             "compilation_config": compilation_config,
@@ -992,10 +993,16 @@ class vLLMHttpServer:
             max_new_tokens=self.config.response_length,
         )
 
-    def _apply_quantization(self) -> tuple[Optional[str], dict]:
-        """Process quantization config. Returns (quantization_str, hf_overrides)."""
+    def _apply_quantization(self) -> tuple[Optional[str], dict, Optional[dict]]:
+        """Process quantization config.
+
+        Returns (quantization_str, hf_overrides, quantization_config), where
+        quantization_config feeds vLLM's ``--quantization-config`` (online
+        quantization) and is None for every checkpoint-format backend.
+        """
         quantization = self.config.quantization
         hf_overrides = {}
+        quantization_config = None
 
         # Handle QAT (Quantization-Aware Training) configuration
         qat_config_dict = getattr(self.config, "qat", {}) or {}
@@ -1022,8 +1029,8 @@ class vLLMHttpServer:
             logger.info(f"QAT quantization config injected (quant_method={quant_method})")
             hf_overrides["quantization_config"] = quantization_config_dict
         elif quantization is not None:
-            # Handle other quantization methods (fp8, torchao)
-            _SUPPORTED_QUANTIZATION = ["fp8", "torchao", "ascend"]
+            # Handle other quantization methods (fp8, mxfp8, torchao)
+            _SUPPORTED_QUANTIZATION = ["fp8", "mxfp8", "torchao", "ascend"]
             if quantization not in _SUPPORTED_QUANTIZATION:
                 raise ValueError(f"Currently only support {_SUPPORTED_QUANTIZATION} quantization, got: {quantization}")
 
@@ -1045,6 +1052,12 @@ class vLLMHttpServer:
                 apply_vllm_quant_patches()
                 # for subprocesses patching
                 os.environ["VERL_VLLM_FP8_QUANT_ENABLED"] = "1"
+            elif quantization == "mxfp8":
+                # Keep the MoE router in BF16; quantizing a discrete routing
+                # decision costs accuracy for no throughput. lm_head needs no
+                # entry: ParallelLMHead is not a LinearBase, so online
+                # quantization skips it already.
+                quantization_config = {"ignore": ["re:.*mlp\\.gate$", "re:.*mlp\\.shared_expert_gate$"]}
 
         model_quantization_config = getattr(self.model_config.hf_config, "quantization_config", {}) or {}
         if quantization is None and model_quantization_config.get("quant_method") == "fp8":
@@ -1054,7 +1067,7 @@ class vLLMHttpServer:
         if quantization is not None and self.config.quantization_config_file is not None:
             hf_overrides["quantization_config_file"] = self.config.quantization_config_file
 
-        return quantization, hf_overrides
+        return quantization, hf_overrides, quantization_config
 
     def _get_worker_extension_cls(self) -> str:
         """Return the fully-qualified colocate worker extension class name."""
